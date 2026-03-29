@@ -6,6 +6,7 @@ from datetime import datetime
 from PySide6.QtCore import Signal, Qt, QThread
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QHBoxLayout,
@@ -89,6 +90,7 @@ class ImportDialog(QDialog):
         self._worker: ImportWorker | None = None
         self._type_combos: list[QComboBox] = []
         self._rarity_combos: list[QComboBox] = []
+        self._include_checkboxes: list[QCheckBox] = []
 
         layout = QVBoxLayout(self)
 
@@ -103,9 +105,9 @@ class ImportDialog(QDialog):
 
         # --- Table ---
         self._table = QTableWidget()
-        self._table.setColumnCount(6)
+        self._table.setColumnCount(7)
         self._table.setHorizontalHeaderLabels(
-            ["Import String", "Identified Word", "Translation", "Type", "Rarity", "Status"]
+            ["Import String", "Identified Word", "Translation", "Type", "Rarity", "Status", "Include"]
         )
         self._table.setRowCount(len(words))
         self._table.verticalHeader().setVisible(False)
@@ -142,6 +144,18 @@ class ImportDialog(QDialog):
             status_item = QTableWidgetItem("Pending")
             status_item.setFlags(status_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self._table.setItem(row, 5, status_item)
+
+            # Include checkbox (checked by default)
+            include_cb = QCheckBox()
+            include_cb.setChecked(True)
+            # Center the checkbox in the cell
+            cb_widget = QWidget()
+            cb_layout = QHBoxLayout(cb_widget)
+            cb_layout.addWidget(include_cb)
+            cb_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            cb_layout.setContentsMargins(0, 0, 0, 0)
+            self._table.setCellWidget(row, 6, cb_widget)
+            self._include_checkboxes.append(include_cb)
 
         layout.addWidget(self._table)
 
@@ -230,6 +244,7 @@ class ImportDialog(QDialog):
         if identified and self._registry.has_word(identified):
             self._table.item(row, 5).setText("Duplicate")
             self._set_row_background(row, _DUPLICATE_COLOR)
+            self._include_checkboxes[row].setChecked(False)
         else:
             if identified:
                 self._table.item(row, 5).setText("New")
@@ -258,7 +273,9 @@ class ImportDialog(QDialog):
             word_type: WordType = self._type_combos[row].currentData()
             rarity: Rarity = self._rarity_combos[row].currentData()
 
-            # Skip rows with no identified word or that are duplicates
+            # Skip unchecked, empty, or duplicate rows
+            if not self._include_checkboxes[row].isChecked():
+                continue
             if not identified:
                 continue
             if self._registry.has_word(identified):
