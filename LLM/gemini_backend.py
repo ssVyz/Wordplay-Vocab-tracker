@@ -1,56 +1,73 @@
 from __future__ import annotations
+
 import json
 import logging
 import re
-from pathlib import Path
+
 from LLM.service import LLMService, WordAnalysis
-from LLM.config import LLMConfig, load_config
 from core.models import WordType, Rarity
 
 logger = logging.getLogger(__name__)
 
 
-class Phi3Backend(LLMService):
-    def __init__(self, config: LLMConfig | None = None):
-        self._config = config or load_config()
-        self._model = None
-        self._load_model()
+class GeminiBackend(LLMService):
+    """LLM backend using Google Gemini 2.5 Flash via the REST API."""
 
-    def _load_model(self):
-        try:
-            from llama_cpp import Llama
-            model_path = Path(__file__).parent / self._config.model_path
-            if not model_path.exists():
-                logger.error(f"Model file not found: {model_path}")
-                return
-            self._model = Llama(
-                model_path=str(model_path),
-                n_ctx=self._config.n_ctx,
-                n_gpu_layers=self._config.n_gpu_layers,
-                verbose=False,
-            )
-            logger.info("Phi-3 model loaded successfully")
-        except Exception as e:
-            logger.error(f"Failed to load Phi-3 model: {e}")
-            self._model = None
+    _MODEL = "gemini-2.5-flash"
+    _ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models"
+
+    def __init__(self, api_key: str) -> None:
+        self._api_key = api_key
+        self._available = bool(api_key)
 
     def is_available(self) -> bool:
-        return self._model is not None
+        return self._available
 
     def _chat(self, system_prompt: str, user_prompt: str) -> str:
-        """Send a chat completion request to the model using Phi-3 chat format."""
-        if not self.is_available():
-            raise RuntimeError("LLM model is not available")
+        """Send a request to the Gemini REST API."""
+        if not self._available:
+            raise RuntimeError("Gemini backend is not configured")
 
-        response = self._model.create_chat_completion(
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
+        import urllib.request
+        import urllib.error
+
+        url = f"{self._ENDPOINT}/{self._MODEL}:generateContent?key={self._api_key}"
+
+        payload = {
+            "system_instruction": {
+                "parts": [{"text": system_prompt}],
+            },
+            "contents": [
+                {"role": "user", "parts": [{"text": user_prompt}]},
             ],
-            temperature=self._config.temperature,
-            max_tokens=self._config.max_tokens,
+            "generationConfig": {
+                "temperature": 0.3,
+                "maxOutputTokens": 1024,
+            },
+        }
+
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
         )
-        return response["choices"][0]["message"]["content"].strip()
+
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="replace")
+            logger.error("Gemini API error %s: %s", exc.code, error_body)
+            raise RuntimeError(f"Gemini API error {exc.code}") from exc
+
+        # Extract text from response
+        try:
+            return body["candidates"][0]["content"]["parts"][0]["text"].strip()
+        except (KeyError, IndexError) as exc:
+            logger.error("Unexpected Gemini response structure: %s", body)
+            raise RuntimeError("Failed to parse Gemini response") from exc
 
     def _parse_json(self, raw: str) -> dict | None:
         """Extract a JSON object from an LLM response string."""
@@ -95,7 +112,7 @@ class Phi3Backend(LLMService):
         data = self._parse_json(raw)
 
         if data is None:
-            logger.error(f"Failed to parse LLM response as JSON: {raw}")
+            logger.error("Failed to parse Gemini response as JSON: %s", raw)
             return WordAnalysis(
                 base_form=word,
                 translation="",
@@ -135,7 +152,7 @@ class Phi3Backend(LLMService):
         data = self._parse_json(raw)
 
         if data is None:
-            logger.error(f"Failed to parse translation response: {raw}")
+            logger.error("Failed to parse Gemini translation response: %s", raw)
             return "(translation failed)"
 
         return data.get("translation", "(unknown)")

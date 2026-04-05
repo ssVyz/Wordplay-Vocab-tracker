@@ -22,14 +22,31 @@ class LLMService(ABC):
         ...
 
     @abstractmethod
-    def analyze_word(self, word: str, language: str) -> WordAnalysis:
-        """Analyze a word: find base form, translate, classify type and rarity.
+    def analyze_word(self, word: str, language: str, context: str | None = None) -> WordAnalysis:
+        """Analyze a word: find base form, classify type and rarity.
 
         Args:
             word: The word to analyze (may be conjugated/declined)
             language: The target language name (e.g., "German", "French")
+            context: Optional surrounding words for disambiguation
+                     (e.g. "die kleine [Katze] lief schnell")
         Returns:
-            WordAnalysis with all fields populated
+            WordAnalysis with base_form, word_type, rarity populated.
+            The translation field may be empty.
+        Raises:
+            RuntimeError if LLM is not available
+        """
+        ...
+
+    @abstractmethod
+    def translate_word(self, word: str, language: str) -> str:
+        """Translate a base-form word to English.
+
+        Args:
+            word: The dictionary/base form of the word
+            language: The source language name
+        Returns:
+            English translation string
         Raises:
             RuntimeError if LLM is not available
         """

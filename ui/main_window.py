@@ -5,8 +5,11 @@ import logging
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QInputDialog,
+    QLabel,
     QMainWindow,
     QMessageBox,
+    QPushButton,
+    QSizePolicy,
     QSplitter,
     QToolBar,
     QWidget,
@@ -16,10 +19,12 @@ from core.language import get_language_path, list_languages
 from core.models import WordEntry
 from core.registry import WordRegistry
 from core.text_parser import tokenize_text
+from LLM import get_gemini_service, get_llm_service
 from LLM.service import LLMService
 from ui.import_dialog import ImportDialog
 from ui.language_selector import LanguageSelector
 from ui.llm_panel import LLMPanel
+from ui.settings_dialog import SettingsDialog
 from ui.word_detail_panel import WordDetailPanel
 from ui.word_list_panel import WordListPanel
 
@@ -40,6 +45,8 @@ class MainWindow(QMainWindow):
 
         self._llm_service = llm_service
         self._registry: WordRegistry | None = None
+        self._current_backend = "phi3"
+        self._gemini_api_key = ""
 
         self._build_ui()
         self._connect_signals()
@@ -65,6 +72,21 @@ class MainWindow(QMainWindow):
 
         self._language_selector = LanguageSelector()
         toolbar.addWidget(self._language_selector)
+
+        # Spacer to push model indicator and settings to the right
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        toolbar.addWidget(spacer)
+
+        # Model indicator
+        self._model_label = QLabel()
+        self._update_model_label()
+        toolbar.addWidget(self._model_label)
+
+        # Settings button
+        settings_btn = QPushButton("Settings")
+        settings_btn.clicked.connect(self._on_settings)
+        toolbar.addWidget(settings_btn)
 
         # Central splitter
         main_splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -156,10 +178,47 @@ class MainWindow(QMainWindow):
             return
 
         dialog = ImportDialog(
-            self, words, language, self._llm_service, self._registry
+            self, words, language, self._llm_service, self._registry,
+            source_text=text,
         )
         if dialog.exec() == ImportDialog.DialogCode.Accepted:
             self._word_list_panel.refresh()
+
+    def _on_settings(self) -> None:
+        dialog = SettingsDialog(
+            self,
+            current_backend=self._current_backend,
+            current_api_key=self._gemini_api_key,
+        )
+        if dialog.exec() != SettingsDialog.DialogCode.Accepted:
+            return
+
+        new_backend = dialog.selected_backend
+        new_key = dialog.gemini_api_key
+
+        # Only rebuild the service if something changed
+        if new_backend == self._current_backend and new_key == self._gemini_api_key:
+            return
+
+        self._gemini_api_key = new_key
+
+        if new_backend == "gemini":
+            self._llm_service = get_gemini_service(new_key)
+        else:
+            self._llm_service = get_llm_service()
+
+        self._current_backend = new_backend
+        self._update_model_label()
+        self._llm_panel.set_llm_service(self._llm_service)
+
+    def _update_model_label(self) -> None:
+        if self._current_backend == "gemini":
+            text = "Model: Gemini 2.5 Flash"
+        else:
+            text = "Model: Phi-3 (Local)"
+        available = self._llm_service.is_available()
+        status = "" if available else " [unavailable]"
+        self._model_label.setText(f"  {text}{status}  ")
 
     def _on_delete_word(self, identified_word: str) -> None:
         if self._registry is None:

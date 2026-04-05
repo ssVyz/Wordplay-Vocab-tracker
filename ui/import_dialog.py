@@ -32,11 +32,15 @@ _DUPLICATE_COLOR = QColor(255, 200, 200)  # Light pink for duplicates
 class ImportWorker(QThread):
     """Background worker that analyses a batch of words through the LLM.
 
-    Emits *word_processed* for each word with its index and the analysis
-    result (or None on error).  Emits *all_done* when the batch is complete.
+    Phase 1: analyse each word (base form, type, rarity) with optional context.
+    Phase 2: translate the determined base form for each word.
+
+    Emits *word_analyzed* after phase-1 for each word and
+    *word_translated* after phase-2.  Emits *all_done* when complete.
     """
 
-    word_processed = Signal(int, object)  # (index, WordAnalysis | None)
+    word_analyzed = Signal(int, object)    # (index, WordAnalysis | None)
+    word_translated = Signal(int, str)     # (index, translation)
     all_done = Signal()
 
     def __init__(
@@ -44,22 +48,70 @@ class ImportWorker(QThread):
         words: list[str],
         language: str,
         llm_service: LLMService,
+        contexts: dict[str, str] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._words = words
         self._language = language
         self._llm_service = llm_service
+        self._contexts = contexts or {}
 
     def run(self) -> None:
+        analyses: list[WordAnalysis | None] = []
+
+        # Phase 1 – analyse (base form, type, rarity)
         for idx, word in enumerate(self._words):
             try:
-                analysis = self._llm_service.analyze_word(word, self._language)
-                self.word_processed.emit(idx, analysis)
+                ctx = self._contexts.get(word)
+                analysis = self._llm_service.analyze_word(word, self._language, context=ctx)
+                analyses.append(analysis)
+                self.word_analyzed.emit(idx, analysis)
             except Exception as exc:
                 logger.warning("LLM analysis failed for '%s': %s", word, exc)
-                self.word_processed.emit(idx, None)
+                analyses.append(None)
+                self.word_analyzed.emit(idx, None)
+
+        # Phase 2 – translate using the base form from phase 1
+        for idx, analysis in enumerate(analyses):
+            if analysis is None:
+                continue
+            try:
+                translation = self._llm_service.translate_word(
+                    analysis.base_form, self._language
+                )
+                self.word_translated.emit(idx, translation)
+            except Exception as exc:
+                logger.warning("LLM translation failed for '%s': %s", analysis.base_form, exc)
+
         self.all_done.emit()
+
+
+class TranslateWorker(QThread):
+    """Translates a single word in the background (used for re-translation)."""
+
+    finished = Signal(int, str)  # (row, translation)
+
+    def __init__(
+        self,
+        row: int,
+        word: str,
+        language: str,
+        llm_service: LLMService,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._row = row
+        self._word = word
+        self._language = language
+        self._llm_service = llm_service
+
+    def run(self) -> None:
+        try:
+            translation = self._llm_service.translate_word(self._word, self._language)
+            self.finished.emit(self._row, translation)
+        except Exception as exc:
+            logger.warning("Re-translation failed for '%s': %s", self._word, exc)
 
 
 class ImportDialog(QDialog):
@@ -77,6 +129,7 @@ class ImportDialog(QDialog):
         language: str,
         llm_service: LLMService,
         registry: WordRegistry,
+        source_text: str | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Import Words")
@@ -87,10 +140,16 @@ class ImportDialog(QDialog):
         self._language = language
         self._llm_service = llm_service
         self._registry = registry
+        self._source_text = source_text
         self._worker: ImportWorker | None = None
+        self._translate_workers: list[TranslateWorker] = []
         self._type_combos: list[QComboBox] = []
         self._rarity_combos: list[QComboBox] = []
         self._include_checkboxes: list[QCheckBox] = []
+        # Track the last base_form per row to detect edits
+        self._last_base_forms: list[str] = [""] * len(words)
+        # Suppress re-translation while the import worker is still running
+        self._import_running = False
 
         layout = QVBoxLayout(self)
 
@@ -174,6 +233,9 @@ class ImportDialog(QDialog):
 
         layout.addLayout(button_layout)
 
+        # Re-translate when the user edits the identified-word column
+        self._table.cellChanged.connect(self._on_cell_changed)
+
         # Start processing
         self._start_processing()
 
@@ -193,24 +255,35 @@ class ImportDialog(QDialog):
             self._submit_button.setEnabled(True)
             return
 
-        self._progress_label.setText(f"Processing word 0/{len(self._words)}...")
+        # Build context snippets when source text is available
+        contexts: dict[str, str] | None = None
+        if self._source_text:
+            from core.text_parser import extract_word_contexts
+            contexts = extract_word_contexts(self._source_text, self._words)
+
+        self._import_running = True
+        self._progress_label.setText(f"Analysing word 0/{len(self._words)}...")
         self._worker = ImportWorker(
-            self._words, self._language, self._llm_service, self
+            self._words, self._language, self._llm_service, contexts, self
         )
-        self._worker.word_processed.connect(self._on_word_processed)
+        self._worker.word_analyzed.connect(self._on_word_analyzed)
+        self._worker.word_translated.connect(self._on_word_translated)
         self._worker.all_done.connect(self._on_all_done)
         self._worker.start()
 
-    def _on_word_processed(self, index: int, analysis: WordAnalysis | None) -> None:
-        """Populate row *index* with analysis results (if any)."""
+    def _on_word_analyzed(self, index: int, analysis: WordAnalysis | None) -> None:
+        """Populate row *index* with analysis results (base form, type, rarity)."""
         self._progress_bar.setValue(index + 1)
         self._progress_label.setText(
-            f"Processing word {index + 1}/{len(self._words)}..."
+            f"Analysing word {index + 1}/{len(self._words)}..."
         )
 
         if analysis is not None:
+            # Block cellChanged signal while we programmatically fill the cell
+            self._table.blockSignals(True)
             self._table.item(index, 1).setText(analysis.base_form)
-            self._table.item(index, 2).setText(analysis.translation)
+            self._last_base_forms[index] = analysis.base_form
+            self._table.blockSignals(False)
 
             # Set type combo
             for i in range(self._type_combos[index].count()):
@@ -227,11 +300,54 @@ class ImportDialog(QDialog):
         # Update status
         self._update_row_status(index)
 
+    def _on_word_translated(self, index: int, translation: str) -> None:
+        """Fill in the translation for row *index* (phase 2)."""
+        self._progress_label.setText(
+            f"Translating word {index + 1}/{len(self._words)}..."
+        )
+        self._table.blockSignals(True)
+        self._table.item(index, 2).setText(translation)
+        self._table.blockSignals(False)
+
     def _on_all_done(self) -> None:
+        self._import_running = False
         self._progress_label.setText("Processing complete.")
         self._finalize_statuses()
         self._submit_button.setEnabled(True)
         self._worker = None
+
+    def _on_cell_changed(self, row: int, column: int) -> None:
+        """Re-translate when the user edits the Identified Word column."""
+        if column != 1:
+            return
+        if self._import_running:
+            return
+        if not self._llm_service.is_available():
+            return
+
+        new_base = self._table.item(row, 1).text().strip()
+        if not new_base or new_base == self._last_base_forms[row]:
+            return
+
+        self._last_base_forms[row] = new_base
+        self._update_row_status(row)
+
+        # Clear old translation while we fetch a new one
+        self._table.blockSignals(True)
+        self._table.item(row, 2).setText("(translating...)")
+        self._table.blockSignals(False)
+
+        worker = TranslateWorker(
+            row, new_base, self._language, self._llm_service, self
+        )
+        worker.finished.connect(self._on_retranslation_done)
+        self._translate_workers.append(worker)
+        worker.start()
+
+    def _on_retranslation_done(self, row: int, translation: str) -> None:
+        self._table.blockSignals(True)
+        self._table.item(row, 2).setText(translation)
+        self._table.blockSignals(False)
 
     def _finalize_statuses(self) -> None:
         """Refresh the status column for every row."""
@@ -307,11 +423,15 @@ class ImportDialog(QDialog):
         self.accept()
 
     # ------------------------------------------------------------------
-    # Override close to clean up worker
+    # Override close to clean up workers
     # ------------------------------------------------------------------
 
     def reject(self) -> None:
         if self._worker is not None and self._worker.isRunning():
             self._worker.quit()
             self._worker.wait(3000)
+        for w in self._translate_workers:
+            if w.isRunning():
+                w.quit()
+                w.wait(1000)
         super().reject()
